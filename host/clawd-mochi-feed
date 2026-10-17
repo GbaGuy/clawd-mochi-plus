@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Feeds the Clawd Mochi from this PC: clock, CPU/RAM/GPU stats, now playing (playerctl),
+weather (Open-Meteo, location from Ryoku's weather setting or ip-api.com like Ryoku does),
+Google Calendar events (the private iCal link saved by `clawd-mochi calendar`),
+and desktop notifications (app + summary only, never the body). Every message goes out
+through `clawd-mochi <command>`, which is a no-op while the Mochi is unplugged.
+Runs as the systemd user service clawd-mochi-feed."""
+import base64, glob, io, json, os, re, struct, subprocess, termios, threading, time, unicodedata
+import urllib.parse, urllib.request
+from pathlib import Path
+
+from PIL import Image
+
+STATS_EVERY = 5      # seconds
+RESEND_EVERY = 20    # re-send clock + music so a replugged/rebooted Mochi catches up
+
+
+def send(line):
+    subprocess.run(["clawd-mochi", line], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+
+
+def send_lines(lines, gap=0.02):
+    """Write many lines in one go, paced so the Mochi's serial buffer keeps up (album art)."""
+    devs = glob.glob("/dev/serial/by-id/usb-Espressif_USB_JTAG*")
+    if not devs:
+        return
+    try:
+        fd = os.open(devs[0], os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)   # never hang on a stuck Mochi
+    except OSError:
+        return
+    try:
+        a = termios.tcgetattr(fd)
+        a[0] = a[1] = a[3] = 0
+        a[2] = (a[2] & ~termios.HUPCL) | termios.CREAD | termios.CLOCAL | termios.CS8
+        termios.tcsetattr(fd, termios.TCSANOW, a)
+        for line in lines:
+            os.write(fd, (line + "\n").encode())
+            time.sleep(gap)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def ascii_text(s, n):
+    # The device font is plain ASCII: "Beyoncé" → "Beyonce", drop what can't map, no tabs/newlines.
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+    return re.sub(r"\s+", " ", s).strip()[:n]
+
+
+# ── stats ────────────────────────────────────────────────────
+
+def cpu_times():
+    f = [int(x) for x in Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]]
+    idle = f[3] + f[4]
+    return sum(f), idle
+
+
+def ram_pct():
+    m = dict(l.split(":", 1) for l in Path("/proc/meminfo").read_text().splitlines())
+    total, avail = int(m["MemTotal"].split()[0]), int(m["MemAvailable"].split()[0])
+    return round(100 * (total - avail) / total)
+
+
+def cpu_temp():
+    for h in Path("/sys/class/hwmon").iterdir():
+        if (h / "name").read_text().strip() in ("coretemp", "k10temp"):
+            return round(int((h / "temp1_input").read_text()) / 1000)
+    return "-"
+
+
+def gpu():
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5).stdout
+        util, temp = (x.strip() for x in out.splitlines()[0].split(","))
+        return util, temp
+    except (OSError, IndexError, ValueError, subprocess.TimeoutExpired):
+        return "-", "-"
+
+
+def week_start():
+    """1 if the locale's week starts on Monday, else 0 (Sunday)."""
+    try:
+        out = subprocess.run(["locale", "first_weekday", "week-1stday"], capture_output=True, text=True).stdout.split()
+        first = int(out[0])                      # 1 = the week-1stday reference day
+        ref = time.strptime(out[1], "%Y%m%d")    # 19971130 is a Sunday, 19971201 a Monday
+        return (ref.tm_wday + first) % 7 == 1    # tm_wday: Monday = 0
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def date_line():
+    t = time.localtime()
+    return f"date {t.tm_year} {t.tm_mon} {t.tm_mday} {int(week_start())}"
+
+
+def clock_line():
+    t = time.localtime()
+    return f"time {t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec}"
+
+
+STATUS_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "clawd-mochi-status.json"
+
+
+def resend_usage():
+    """Replay Claude Code's last status line (if under 15 min old) so a rebooted Mochi gets usage back."""
+    try:
+        if time.time() - STATUS_FILE.stat().st_mtime < 15 * 60:
+            with STATUS_FILE.open() as f:
+                subprocess.run(["clawd-mochi", "statusline"], stdin=f, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=5)
+    except OSError:
+        pass
+
+
+def stats_loop():
+    prev = cpu_times()
+    last_resend = 0
+    while True:
+        time.sleep(STATS_EVERY)
+        cur = cpu_times()
+        total, idle = cur[0] - prev[0], cur[1] - prev[1]
+        prev = cur
+        cpu = round(100 * (total - idle) / total) if total else 0
+        util, gtemp = gpu()
+        send(f"stats {cpu} {ram_pct()} {util} {cpu_temp()} {gtemp}")
+        if time.time() - last_resend > RESEND_EVERY:
+            last_resend = time.time()
+            send(clock_line())
+            send(date_line())
+            with music_lock:
+                line, art = music_line, music_art
+            if line:
+                send_lines(art)
+                send(line)
+                send_pos()
+            if weather_line:
+                send(weather_line)
+            if events_lines:
+                send_lines(events_lines)
+            resend_usage()
+            sync_notifs()
+
+
+# ── now playing ──────────────────────────────────────────────
+
+music_line = ""
+music_art = ["art none"]
+music_lock = threading.Lock()
+
+
+def send_pos():
+    """Where the current track is (playerctl reports microseconds); the Mochi extrapolates between."""
+    try:
+        out = subprocess.run(["playerctl", "metadata", "--format", "{{position}} {{mpris:length}}"],
+                             capture_output=True, text=True, timeout=3).stdout.split()
+        pos, length = (int(x) // 1_000_000 for x in out[:2])
+        send(f"musicpos {pos} {length}")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+
+
+def music_loop():
+    global music_line, music_art
+    fmt = "{{lc(status)}}\t{{title}}\t{{artist}}\t{{mpris:artUrl}}"
+    art_url = None
+    while True:
+        p = subprocess.Popen(["playerctl", "--follow", "metadata", "--format", fmt],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        for raw in p.stdout:
+            status, _, rest = raw.rstrip("\n").partition("\t")
+            title, _, rest = rest.partition("\t")
+            artist, _, url = rest.partition("\t")
+            line = f"music {status or 'stopped'} {ascii_text(title, 60)}\t{ascii_text(artist, 60)}"
+            if url != art_url:   # new cover: fetch once, keep for re-sends
+                art_url = url
+                art = art_lines(url) if url else ["art none"]
+                with music_lock:
+                    music_art = art
+                send_lines(art)
+            with music_lock:
+                music_line = line
+            send(line)
+            send_pos()
+        p.wait()
+        time.sleep(5)   # playerctl exits when no player bus is around; try again
+
+
+# ── album art ────────────────────────────────────────────────
+
+ART = 128
+MAX_ART_BYTES = 5 * 1024 * 1024
+
+
+def art_lines(url):
+    """MPRIS artUrl (file:// or http(s)://) → the Mochi's art command lines, or ["art none"]."""
+    try:
+        u = urllib.parse.urlparse(url)
+        if u.scheme == "file":
+            raw = Path(urllib.parse.unquote(u.path)).read_bytes()[:MAX_ART_BYTES]
+        elif u.scheme in ("http", "https"):
+            with urllib.request.urlopen(url, timeout=5) as r:
+                raw = r.read(MAX_ART_BYTES)
+        else:
+            return ["art none"]
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        side = min(img.size)   # centre-crop to a square, then shrink
+        left, top = (img.width - side) // 2, (img.height - side) // 2
+        img = img.crop((left, top, left + side, top + side)).resize((ART, ART), Image.LANCZOS)
+        # page colours: the cover's average, text black or white, whichever reads better on it
+        r_, g_, b_ = img.resize((1, 1), Image.BOX).getpixel((0, 0))
+        r_, g_, b_ = (int(c * 0.8) for c in (r_, g_, b_))          # a touch darker than the cover
+        ink = "000000" if 0.299 * r_ + 0.587 * g_ + 0.114 * b_ > 140 else "ffffff"
+        colors = f"art colors {r_:02x}{g_:02x}{b_:02x} {ink}"
+        px = b"".join(struct.pack("<H", ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)) for r, g, b in img.getdata())
+        b64 = base64.b64encode(px).decode()
+        return (["art begin"] + [f"art data {b64[i:i + 1024]}" for i in range(0, len(b64), 1024)]
+                + ["art end", colors])
+    except Exception:
+        return ["art none"]
+
+
+# ── weather ──────────────────────────────────────────────────
+
+WEATHER_EVERY = 15 * 60
+weather_line = ""
+
+
+def get_json(url):
+    with urllib.request.urlopen(url, timeout=10) as r:
+        return json.load(r)
+
+
+def location():
+    """Ryoku's weather location if the user set one (Hub), else IP geolocation (same as Ryoku)."""
+    try:
+        q = json.loads((Path.home() / ".config/ryoku/shell.json").read_text())["general"]["weather_location_query"]
+        if q.get("lat") or q.get("lon"):
+            return q["lat"], q["lon"], q.get("name") or ""
+    except (OSError, KeyError, ValueError):
+        pass
+    j = get_json("http://ip-api.com/json/?fields=status,city,lat,lon")
+    return j["lat"], j["lon"], j.get("city", "")
+
+
+def fahrenheit():
+    try:
+        g = json.loads((Path.home() / ".config/ryoku/shell.json").read_text())["general"]
+        return g.get("temperature_unit") == "Imperial"
+    except (OSError, KeyError, ValueError):
+        return False
+
+
+def weather_loop():
+    global weather_line
+    while True:
+        try:
+            lat, lon, city = location()
+            unit = "&temperature_unit=fahrenheit" if fahrenheit() else ""
+            w = get_json("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
+                         "&current=temperature_2m,relative_humidity_2m,weather_code"
+                         "&daily=weather_code,temperature_2m_max,temperature_2m_min"
+                         "&timezone=auto&forecast_days=3%s" % (lat, lon, unit))
+            c, d = w["current"], w["daily"]
+            days = [f"{time.strftime('%a', time.strptime(d['time'][i], '%Y-%m-%d'))} {d['weather_code'][i]} "
+                    f"{round(d['temperature_2m_max'][i])} {round(d['temperature_2m_min'][i])}" for i in (1, 2)]
+            line = (f"weather {round(c['temperature_2m'])} {c['weather_code']} {round(d['temperature_2m_max'][0])} "
+                    f"{round(d['temperature_2m_min'][0])} {c['relative_humidity_2m']}\t{ascii_text(city, 18)}\t"
+                    + "\t".join(days))
+            weather_line = line
+            send(line)
+        except Exception:
+            pass   # offline / API hiccup: keep the last one, try again next round
+        time.sleep(WEATHER_EVERY)
+
+
+# ── calendar ─────────────────────────────────────────────────
+
+CALENDAR_EVERY = 10 * 60
+ICAL_URL_FILE = Path.home() / ".config/clawd-mochi/ical-url"
+events_lines = []
+
+
+def when_text(start, end, all_day, now):
+    """'now, until 15:00' / 'today 14:00' / 'tomorrow all day' / 'Tue 21 Oct 09:30'."""
+    import datetime as dt
+    today = now.date()
+    day = start if all_day else start.date()
+    if not all_day and start <= now < end:
+        return f"now, until {end:%H:%M}"
+    label = ("today" if day == today else "tomorrow" if day == today + dt.timedelta(days=1)
+             else f"{day:%a %d %b}")
+    return f"{label} all day" if all_day else f"{label} {start:%H:%M}"
+
+
+def calendar_lines():
+    import datetime as dt
+    import icalendar, recurring_ical_events     # pacman: python-icalendar python-recurring-ical-events
+    url = ICAL_URL_FILE.read_text().strip()
+    with urllib.request.urlopen(url, timeout=20) as r:
+        cal = icalendar.Calendar.from_ical(r.read())
+    now = dt.datetime.now().astimezone()
+    month_start = now.date().replace(day=1)
+    next_month = (month_start + dt.timedelta(days=32)).replace(day=1)
+    horizon = max(next_month, now.date() + dt.timedelta(days=14))
+    days, upcoming = 0, []
+    for ev in recurring_ical_events.of(cal).between(month_start, horizon):
+        start, end = ev["DTSTART"].dt, (ev.get("DTEND") or ev["DTSTART"]).dt
+        all_day = not isinstance(start, dt.datetime)
+        if not all_day:
+            start, end = start.astimezone(), end.astimezone()
+        first = start if all_day else start.date()
+        last = (end - dt.timedelta(days=1)) if all_day else end.date()   # all-day DTEND is exclusive
+        d = first
+        while d <= max(first, last):
+            if d.year == now.year and d.month == now.month:
+                days |= 1 << (d.day - 1)
+            d += dt.timedelta(days=1)
+        ended = (last < now.date()) if all_day else (end <= now)
+        if not ended:
+            upcoming.append((first if all_day else start.date(), not all_day, start if not all_day else None,
+                             when_text(max(first, now.date()) if all_day else start, end, all_day, now), ascii_text(str(ev.get("SUMMARY", "(no title)")), 36)))
+    upcoming.sort(key=lambda e: (e[0], e[1], e[2] or now))   # by day, all-day first, then time
+    return (["events clear", f"events days {days}"]
+            + [f"events add {when}\t{title}" for *_, when, title in upcoming[:4]])
+
+
+def calendar_loop():
+    global events_lines
+    while True:
+        if ICAL_URL_FILE.exists():
+            try:
+                events_lines = calendar_lines()
+                send_lines(events_lines)
+            except Exception:
+                pass   # libs missing, offline or a bad link: try again next round
+        time.sleep(CALENDAR_EVERY)
+
+
+# ── notifications ────────────────────────────────────────────
+
+notif_history = []   # last 4 as (when, text), oldest first; memory only, never written to disk
+notif_lock = threading.Lock()
+
+
+last_ngen = None
+
+
+def sync_notifs():
+    """Every resend: a +1 notification generation = the user wiped history → forget it too;
+    any other change = the Mochi restarted → send the history again."""
+    global last_ngen
+    try:
+        out = subprocess.run(["clawd-mochi", "state"], capture_output=True, text=True, timeout=5).stdout
+        ngen = json.loads(out)["ngen"]
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+        return
+    if last_ngen is not None and ngen == last_ngen + 1:
+        with notif_lock:
+            notif_history.clear()
+    elif ngen != last_ngen and notif_history:
+        send_lines(notif_lines())
+    last_ngen = ngen
+
+
+def notif_lines():
+    with notif_lock:
+        return ["notifs clear"] + [f"notifs add {when}\t{text}" for when, text in notif_history]
+
+
+def notify_loop():
+    rule = "type='method_call',interface='org.freedesktop.Notifications',member='Notify'"
+    while True:
+        p = subprocess.Popen(["dbus-monitor", "--session", rule], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True)
+        strings = None   # Notify args: app_name, replaces_id, icon, summary, body…
+        for line in p.stdout:
+            if "member=Notify" in line:
+                strings = []
+                continue
+            m = re.match(r'\s+string "(.*)"$', line)
+            if strings is not None and m:
+                strings.append(m.group(1))
+                if len(strings) == 3:   # app, icon, summary: enough
+                    app, summary = ascii_text(strings[0], 20), ascii_text(strings[2], 40)
+                    if app or summary:
+                        send(f"notify {app}\t{summary}")
+                        with notif_lock:
+                            notif_history.append((f"{time.strftime('%H:%M')}  {app}", summary or app))
+                            del notif_history[:-4]
+                        send_lines(notif_lines())
+                    strings = None
+        p.wait()
+        time.sleep(5)
+
+
+if __name__ == "__main__":
+    send(clock_line())
+    send(date_line())
+    for loop in (music_loop, notify_loop, weather_loop, calendar_loop):
+        threading.Thread(target=loop, daemon=True).start()
+    stats_loop()

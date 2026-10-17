@@ -1,0 +1,106 @@
+#!/bin/sh
+# Talk to a Clawd Mochi over USB.
+#   clawd-mochi <command...>   e.g. clawd-mochi mood think / clawd-mochi say hi
+#   clawd-mochi hook           Claude Code hook: reads the event JSON on stdin
+# Never fails and never blocks long, so it is safe as a hook.
+
+dev=$(ls /dev/serial/by-id/usb-Espressif_USB_JTAG* 2>/dev/null | head -n1)
+
+# While `clawd-mochi flash` runs, nobody else may write to the port (it corrupts the upload).
+lock=${XDG_RUNTIME_DIR:-/tmp}/clawd-mochi-flashing
+
+send() {
+  [ -e "$lock" ] && return 0
+  [ -w "$dev" ] || return 0
+  # KILL, not TERM: if the Mochi stops reading, a blocked write must not linger and hold the port
+  timeout -s KILL 1 sh -c 'printf "%s\n" "$2" > "$1"' _ "$dev" "$*" 2>/dev/null
+}
+
+ev=
+field() { printf '%s' "$ev" | jq -r "$1 // empty" 2>/dev/null; }
+
+case $1 in
+  hook) ev=$(cat) ;;
+  statusline)
+    # Wraps the real statusline: passes stdin through untouched, forwards usage + clock.
+    ev=$(cat)
+    printf '%s' "$ev"
+    printf '%s' "$ev" > "${XDG_RUNTIME_DIR:-/tmp}/clawd-mochi-status.json"
+    usage=$(printf '%s' "$ev" | jq -r '
+      def p: if . == null then "-" else (. | floor | tostring) end;
+      [ (.rate_limits.five_hour.used_percentage | p),
+        (.rate_limits.seven_day.used_percentage | p),
+        (.context_window.used_percentage | p),
+        (.rate_limits.five_hour.resets_at
+           | if . == null then "-" else (if type == "string" then fromdateiso8601? // null else . end
+             | if . == null then "-" else (localtime | strftime("%H:%M")) end) end)
+      ] | join(" ")' 2>/dev/null)
+    { send "time $(( $(date +%s) - $(date -d 'today 00:00' +%s) ))"
+      [ -n "$usage" ] && send "usage $usage"; } >/dev/null 2>&1 &
+    exit 0 ;;
+  flash)
+    # Flash the last build (build/ in this repo): hooks, status line and feed stay quiet meanwhile.
+    root=$(dirname "$(dirname "$(readlink -f "$0")")")
+    touch "$lock"
+    systemctl --user stop clawd-mochi-feed 2>/dev/null
+    fuser -k "$dev" 2>/dev/null   # anything still holding the port (a stuck write) would break the upload
+    sleep 1
+    ac=$root/tools/arduino-cli; [ -x "$ac" ] || ac=arduino-cli
+    "$ac" upload --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc -p "$dev" --input-dir "$root/build" "$root/firmware"
+    rc=$?
+    rm -f "$lock"
+    sleep 5
+    systemctl --user start clawd-mochi-feed 2>/dev/null
+    exit $rc ;;
+  ui) exec "$(dirname "$(readlink -f "$0")")/clawd-mochi-ui" ;;
+  snap) exec "$(dirname "$(readlink -f "$0")")/clawd-mochi-ui" --snap "$2" ;;   # save the screen as a PNG
+  ip|state)
+    # Ask the device: "ip" → home-network IP, "state" → live state JSON.
+    [ -e "$lock" ] && { echo "flashing in progress" >&2; exit 1; }
+    [ -w "$dev" ] || { echo "no Clawd Mochi on USB" >&2; exit 1; }
+    # one question at a time: two readers on the port would steal each other's replies
+    exec 9>"${XDG_RUNTIME_DIR:-/tmp}/clawd-mochi-serial.lock"
+    flock -w 5 9 || exit 1
+    stty -F "$dev" 115200 raw -echo -hupcl
+    exec 3<>"$dev"; printf '%s\n' "$1" >&3; timeout 2 head -n1 <&3; exit 0 ;;
+  calendar)
+    # Interactive: save your Google Calendar "Secret address in iCal format" for the feed.
+    # Google Calendar → Settings → your calendar → Integrate calendar → Secret address in iCal format.
+    f=${XDG_CONFIG_HOME:-$HOME/.config}/clawd-mochi/ical-url
+    mkdir -p "$(dirname "$f")"
+    printf 'Paste the secret iCal address: '; stty -echo; read -r url; stty echo; echo
+    case $url in https://*) ;; *) echo "that doesn't look like an https link"; exit 1 ;; esac
+    ( umask 077; printf '%s\n' "$url" > "$f" )
+    systemctl --user restart clawd-mochi-feed 2>/dev/null
+    echo "saved to $f (only you can read it); events show up within a minute"
+    exit 0 ;;
+  wifi)
+    # Interactive: put the Mochi on your home WiFi (2.4 GHz). The password never touches disk here.
+    [ -w "$dev" ] || { echo "no Clawd Mochi on USB"; exit 1; }
+    cur=$(nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | sed -n 's/^yes://p' | head -n1)
+    printf 'WiFi name [%s]: ' "$cur"; read -r ssid; ssid=${ssid:-$cur}
+    printf 'Password: '; stty -echo; read -r pass; stty echo; echo
+    send "wifi $ssid	$pass"
+    echo "joining $ssid…"; sleep 8; "$0" ip; echo "then open http://clawd-mochi.local"
+    exit 0 ;;
+  *) send "$*"; exit 0 ;;
+esac
+
+case $(field .hook_event_name) in
+  SessionStart)     send "mood idle" ;;
+  UserPromptSubmit) send "mood think" ;;
+  PreToolUse)       send "mood work $(field .tool_name)" ;;
+  PostToolUse)      send "mood think" ;;
+  Notification)
+    # The "waiting for your input" reminder (60 s after a reply) is not urgent: no flashing for it.
+    msg=$(field .message)
+    case "$(field .notification_type) $msg" in
+      idle_prompt*|*"waiting for your input"*) ;;
+      *) send "mood wait $msg" ;;
+    esac ;;
+  PermissionRequest) send "mood wait allow $(field .tool_name)?" ;;
+  Stop)             send "mood happy done!" ;;
+  StopFailure)      send "mood wait something broke" ;;
+  SessionEnd)       send "mood sleep" ;;
+esac
+exit 0

@@ -1,0 +1,7 @@
+# local only: toolchain, build output, the original repo checkout, device flash backups
+tools/
+build/
+upstream/
+backup/
+*.bin
+__pycache__/

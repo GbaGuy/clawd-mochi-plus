@@ -1,0 +1,13 @@
+[Unit]
+Description=Clawd Mochi feed (clock, PC stats, now playing, notifications)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/clawd-mochi-feed
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

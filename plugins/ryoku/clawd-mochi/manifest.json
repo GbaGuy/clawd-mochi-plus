@@ -1,0 +1,47 @@
+{
+  "id": "clawd-mochi",
+  "name": "Clawd Mochi",
+  "version": "0.1.0",
+  "author": "guyb <blumguy111@gmail.com>",
+  "description": "Control your Clawd Mochi desk buddy from the bar: set its mood, start a focus timer, put a message on its screen, switch the backlight, or open the full controller. Talks to the device over USB.",
+  "license": "MIT",
+  "official": false,
+  "hosts": [
+    "topbarGlyph"
+  ],
+  "entryPoints": {
+    "main": "service/Main.qml",
+    "content": "content/Widget.qml",
+    "panel": "content/Panel.qml"
+  },
+  "panel": {
+    "width": 300
+  },
+  "files": [
+    "assets/preview-widget.png",
+    "assets/preview-panel.png"
+  ],
+  "capabilities": {
+    "densities": [
+      "glyph",
+      "compact"
+    ],
+    "network": [
+      "127.0.0.1"
+    ]
+  },
+  "defaults": {
+    "host": "topbarGlyph",
+    "label": "Clawd Mochi"
+  },
+  "dependencies": {
+    "commands": [
+      "clawd-mochi",
+      "clawd-mochi-ui",
+      "xdg-open"
+    ]
+  },
+  "metadata": {
+    "settings": []
+  }
+}
