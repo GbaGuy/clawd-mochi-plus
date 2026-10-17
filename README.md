@@ -10,6 +10,12 @@ desk toy: an ESP32-C3 with a 240×240 screen that shows Clawd.
 >
 > Fan project, not affiliated with Anthropic.
 
+<p align="center">
+  <img src="docs/demo.webp" width="400" alt="Clawd Mochi Plus on a desk: thinking, a permission prompt flashing, pages switching, then a happy 'done!'">
+  <br><sub>Thinking → a permission prompt (yellow flash) → stats, history, calendar and timer pages → "done!" → usage.
+  <a href="docs/demo.mp4">MP4</a></sub>
+</p>
+
 <p>
 <img src="docs/screens/clawd.png" width="160" alt="Clawd idle">
 <img src="docs/screens/thinking.png" width="160" alt="Clawd thinking">
